@@ -2,11 +2,14 @@
  * Post-build script: converts TanStack Start's dist/ output into
  * Vercel's Build Output API format (.vercel/output/).
  *
- * Run via: node scripts/build-vercel.mjs
+ * Vite's SSR build keeps npm packages as external bare imports, which
+ * serverless functions can't resolve. esbuild re-bundles everything into
+ * a single self-contained CJS file targeting the Node.js runtime.
  */
 
 import { cpSync, mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
+import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
@@ -19,52 +22,142 @@ mkdirSync(resolve(out, "static"), { recursive: true });
 mkdirSync(resolve(out, "functions/index.func"), { recursive: true });
 
 // ── 2. Static assets ─────────────────────────────────────────────────────────
-// dist/client  →  .vercel/output/static
 cpSync(resolve(root, "dist/client"), resolve(out, "static"), { recursive: true });
-
-// public/  →  .vercel/output/static  (robots.txt etc.)
 if (existsSync(resolve(root, "public"))) {
   cpSync(resolve(root, "public"), resolve(out, "static"), { recursive: true });
 }
 
-// ── 3. Edge Function bundle ───────────────────────────────────────────────────
-// Copy the entire server bundle into the function directory so that
-// all dynamic import() chunks resolve correctly via relative paths.
-cpSync(resolve(root, "dist/server"), resolve(out, "functions/index.func"), {
-  recursive: true,
-});
+// ── 3. Bundle server → single CJS file ───────────────────────────────────────
+// Mark client-only packages external — they're never needed for SSR rendering.
+const clientOnlyExternals = [
+  "@streamdown/code",    // syntax highlighting — DOM + large parsers
+  "@streamdown/mermaid", // diagram rendering — needs mermaid/DOM
+  "@streamdown/math",    // LaTeX rendering — katex is DOM-heavy
+  "@streamdown/cjk",
+  "streamdown",
+  "mermaid",
+  "motion",
+  "motion/react",
+  "recharts",
+  "embla-carousel-react",
+  "react-day-picker",
+  "react-resizable-panels",
+  "input-otp",
+  "vaul",
+  "cmdk",
+];
 
-// Thin entry-point wrapper: Vercel Edge expects a default-exported fetch handler.
+// Resolve esbuild binary: prefer direct dep, fall back to Vite's copy
+const esbuildBin = existsSync(resolve(root, "node_modules/.bin/esbuild"))
+  ? resolve(root, "node_modules/.bin/esbuild")
+  : resolve(root, "node_modules/vite/node_modules/.bin/esbuild");
+
+const bundleOut = resolve(out, "functions/index.func/bundle.js");
+const externals = [
+  "node:*",
+  ...clientOnlyExternals,
+].map((e) => `--external:${e}`).join(" ");
+
+console.log("Bundling server with esbuild…");
+execSync(
+  [
+    `"${esbuildBin}"`,
+    `"${resolve(root, "dist/server/server.js")}"`,
+    "--bundle",
+    "--format=cjs",
+    "--platform=node",
+    "--target=node20",
+    `--outfile="${bundleOut}"`,
+    externals,
+    '--define:process.env.NODE_ENV=\\"production\\"',
+    "--minify",
+    "--log-level=warning",
+  ].join(" "),
+  { cwd: root, stdio: "inherit" }
+);
+
+// ── 4. Serverless Function entry-point ────────────────────────────────────────
+// Bridge Node.js IncomingMessage ↔ Web Request/Response so the TanStack Start
+// fetch-based handler works inside a Vercel Node.js serverless function.
 writeFileSync(
   resolve(out, "functions/index.func/entry.js"),
-  `import handler from "./server.js";
-export default (request) => handler.fetch(request, {}, {});
+  `"use strict";
+const { default: handler } = require("./bundle.js");
+
+module.exports = async function vercelHandler(req, res) {
+  // ── Build Web Request ──────────────────────────────────────────────────────
+  const proto = req.headers["x-forwarded-proto"] || "https";
+  const host  = req.headers["x-forwarded-host"]  || req.headers.host || "localhost";
+  const url   = new URL(req.url, \`\${proto}://\${host}\`);
+
+  const headers = new Headers();
+  for (const [k, v] of Object.entries(req.headers)) {
+    if (v == null) continue;
+    Array.isArray(v) ? v.forEach((h) => headers.append(k, h)) : headers.set(k, v);
+  }
+
+  let body;
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    if (chunks.length) body = Buffer.concat(chunks);
+  }
+
+  const webReq = new Request(url.toString(), {
+    method: req.method,
+    headers,
+    body: body || undefined,
+    duplex: "half",
+  });
+
+  // ── Call handler ───────────────────────────────────────────────────────────
+  const webRes = await handler.fetch(webReq, {}, {});
+
+  // ── Write Node.js response ────────────────────────────────────────────────
+  res.statusCode = webRes.status;
+  for (const [k, v] of webRes.headers.entries()) res.setHeader(k, v);
+
+  if (!webRes.body) { res.end(); return; }
+
+  const reader = webRes.body.getReader();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    res.write(Buffer.from(value));
+  }
+  res.end();
+};
 `
 );
 
-// Edge function metadata
 writeFileSync(
   resolve(out, "functions/index.func/.vc-config.json"),
-  JSON.stringify({ runtime: "edge", entrypoint: "entry.js" }, null, 2)
+  JSON.stringify(
+    { runtime: "nodejs20.x", handler: "entry.js", maxDuration: 30 },
+    null,
+    2
+  )
 );
 
-// ── 4. Routing config ─────────────────────────────────────────────────────────
-const config = {
-  version: 3,
-  routes: [
-    // Immutable cache headers for hashed asset chunks
+// ── 5. Routing config ─────────────────────────────────────────────────────────
+writeFileSync(
+  resolve(out, "config.json"),
+  JSON.stringify(
     {
-      src: "/assets/(.*)",
-      headers: { "cache-control": "public, immutable, max-age=31536000" },
-      continue: true,
+      version: 3,
+      routes: [
+        {
+          src: "/assets/(.*)",
+          headers: { "cache-control": "public, immutable, max-age=31536000" },
+          continue: true,
+        },
+        { handle: "filesystem" },
+        { src: "/(.*)", dest: "/index" },
+      ],
     },
-    // Serve static files first (robots.txt, favicon, etc.)
-    { handle: "filesystem" },
-    // Everything else → SSR edge function
-    { src: "/(.*)", dest: "/index" },
-  ],
-};
-
-writeFileSync(resolve(out, "config.json"), JSON.stringify(config, null, 2));
+    null,
+    2
+  )
+);
 
 console.log("✓  Vercel output written to .vercel/output/");
