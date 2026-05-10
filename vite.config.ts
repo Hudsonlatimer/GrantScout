@@ -3,13 +3,12 @@ import { tanstackStart } from "@tanstack/react-start/plugin/vite";
 import viteReact from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import tsConfigPaths from "vite-tsconfig-paths";
-import { cloudflare } from "@cloudflare/vite-plugin";
 import path from "node:path";
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
 
-  // Forward VITE_* / SUPABASE_* to process.env so server-side code can read them
+  // Forward VITE_* / SUPABASE_* / GROQ_* to process.env so server-side code can read them
   for (const [k, v] of Object.entries(env)) {
     if (!process.env[k]) process.env[k] = v;
   }
@@ -26,9 +25,13 @@ export default defineConfig(({ mode }) => {
     plugins: [
       tsConfigPaths(),
       tailwindcss(),
-      tanstackStart({ server: { entry: "server" } }),
+      tanstackStart({
+        server: {
+          preset: "vercel",
+          entry: "server",
+        },
+      }),
       viteReact(),
-      cloudflare({ viteEnvironment: { name: "ssr" } }),
     ],
   };
 });
